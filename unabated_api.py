@@ -6,6 +6,7 @@ import logging
 import json
 import sqlite3
 from typing import Dict, List
+from team_mapping import NBA_TEAM_IDS, get_team_abbr, get_team_name
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -35,8 +36,44 @@ def reset_database():
         raise
 
 # Reference data
-TRACKED_LEAGUES = {1: "NFL", 3: "NBA", 4: "CBB"}
-TRACKED_BET_TYPES = {1: "Moneyline", 2: "Spread", 3: "Total"}
+LEAGUES = {
+    1: "NFL",
+    2: "CFB", 
+    3: "NBA",
+    4: "CBB",
+    5: "MLB",
+    6: "NHL"
+}
+
+BET_TYPES = {
+    1: "Moneyline",
+    2: "Spread", 
+    3: "Total"
+}
+
+SIDE_INDEX = {
+    0: "away/over",
+    1: "home/under"
+}
+
+STATUS_ID = {
+    1: "Pregame",
+    2: "Live",
+    3: "Final",
+    4: "Delayed",
+    5: "Postponed",
+    6: "Cancelled"
+}
+
+SPORTSBOOKS = {
+    1: "DraftKings",
+    2: "FanDuel",
+    4: "BetMGM",
+    6: "Circa",
+    7: "Pinnacle",
+    8: "Bookmaker",
+    # ... add other sportsbooks
+}
 
 def init_database():
     """Initialize SQLite database with required tables."""
@@ -115,8 +152,6 @@ def parse_game_odds_events(data):
     """Parse game odds events from Unabated API response."""
     events = []
     
-    # Get the gameOddsEvents section which contains all leagues/periods
-    # Format: lg{league-id}:pt{period-type-id}:{pregame/live}
     game_odds_events = data.get('results', [{}])[0].get('gameOdds', {}).get('gameOddsEvents', {})
     
     for league_period_key, events_list in game_odds_events.items():
@@ -126,28 +161,14 @@ def parse_game_odds_events(data):
             status_id = event.get('statusId')
             game_clock = event.get('gameClock')
             
-            # Only process if we have valid event data
             if not event_id:
                 continue
                 
-            # Process each market source line
-            # Format: si{side-index}:ms{market-source-id}:an{alternate-line-index}
             market_lines = event.get('gameOddsMarketSourcesLines', {})
             for market_key, bet_types in market_lines.items():
-                # Parse market key components
-                key_parts = market_key.split(':')
-                if len(key_parts) != 3:
-                    continue
-                    
-                side_index = key_parts[0].replace('si', '')  # 0=away/over, 1=home/under
-                market_source = key_parts[1].replace('ms', '')
-                
-                # Process each bet type (bt1=moneyline, bt2=spread, bt3=total)
                 for bet_type, line in bet_types.items():
-                    # Only process spread (bt2) for now
                     if bet_type != 'bt2':
                         continue
-                        
                     points = line.get('points')
                     price = line.get('sourcePrice')
                     source_format = line.get('sourceFormat')
@@ -160,7 +181,7 @@ def parse_game_odds_events(data):
                         'event_id': str(event_id),
                         'timestamp_utc': modified_on or event_start,
                         'bet_type': bet_type.replace('bt', ''),
-                        'side_index': int(side_index),
+                        'side_index': int(market_key.replace('si','').split(':')[0]),
                         'source_format': source_format,
                         'points': float(points) if points is not None else None,
                         'price': float(price),
@@ -179,7 +200,6 @@ def store_game_odds(events):
     cursor = conn.cursor()
     
     try:
-        # Use INSERT OR REPLACE to handle updates
         cursor.executemany("""
             INSERT OR REPLACE INTO game_odds (
                 event_id, timestamp_utc, bet_type, side_index, 
@@ -202,132 +222,6 @@ def store_game_odds(events):
     finally:
         conn.close()
 
-def compute_pregame_implied_vol() -> None:
-    """Compute pregame implied volatility for each event."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Get latest odds for each event
-        cursor.execute("""
-            WITH latest_odds AS (
-                SELECT 
-                    event_id,
-                    points as spread,
-                    price,
-                    source_format,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY event_id 
-                        ORDER BY timestamp_utc DESC
-                    ) as rn
-                FROM game_odds
-                WHERE game_clock IS NULL  -- pregame only
-                AND bet_type = '2'  -- spread only
-            )
-            SELECT 
-                event_id,
-                spread,
-                price,
-                source_format
-            FROM latest_odds
-            WHERE rn = 1
-        """)
-        
-        events = cursor.fetchall()
-        for event in events:
-            event_id, spread, price, source_format = event
-            
-            # Convert odds to probability
-            prob = get_odds_probability(price, source_format)
-            
-            # Compute implied vol
-            if spread is not None and prob is not None:
-                home_vol = compute_implied_vol(abs(spread), prob)
-                away_vol = compute_implied_vol(abs(spread), 1 - prob)
-                
-                if home_vol and away_vol:
-                    try:
-                        cursor.execute("""
-                            INSERT INTO pregame_volatilities (
-                                event_id,
-                                timestamp_utc,
-                                home_spread,
-                                home_prob,
-                                away_prob,
-                                home_implied_vol,
-                                away_implied_vol
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            event_id,
-                            datetime.utcnow().isoformat(),
-                            spread,
-                            prob,
-                            1 - prob,
-                            home_vol,
-                            away_vol
-                        ))
-                    except Exception as e:
-                        logging.error(f"Error storing implied vol: {str(e)}")
-                        continue
-        
-        conn.commit()
-        
-    except Exception as e:
-        logging.error(f"Error computing implied vol: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-
-def get_odds_probability(price: float, source_format: int) -> float:
-    """
-    Convert odds to probability based on source format.
-    Following Unabated API source formats:
-    1 = American
-    2 = Decimal
-    3 = Percent
-    4 = Probability
-    5 = Sporttrade (0 to 100)
-    """
-    try:
-        if source_format == 1:  # American
-            if price > 0:
-                return 100.0 / (100.0 + price)
-            else:
-                return abs(price) / (abs(price) + 100.0)
-        elif source_format == 2:  # Decimal
-            return 1.0 / price
-        elif source_format == 3:  # Percent
-            return price / 100.0
-        elif source_format == 4:  # Probability
-            return price
-        elif source_format == 5:  # Sporttrade
-            return price / 100.0
-        else:
-            logging.warning(f"Unknown source format: {source_format}")
-            return None
-    except Exception as e:
-        logging.error(f"Error converting odds to probability: {e}")
-        return None
-
-def compute_implied_vol(spread: float, prob: float) -> float:
-    """Compute implied volatility from spread and probability."""
-    try:
-        if not 0 < prob < 1 or spread <= 0:
-            return None
-            
-        # Use inverse normal CDF to get z-score
-        from scipy.stats import norm
-        z_score = norm.ppf(prob)
-        
-        # Implied vol = |spread| / z_score
-        implied_vol = abs(spread) / abs(z_score)
-        
-        return implied_vol
-        
-    except Exception as e:
-        logging.error(f"Error computing implied vol: {e}")
-        return None
-
 def fetch_snapshot():
     url = f"{BASE_URL}/markets/gameOdds"
     headers = {"x-api-key": API_KEY}
@@ -338,129 +232,270 @@ def fetch_snapshot():
         response.raise_for_status()
         data = response.json()
         logging.info("Snapshot fetched successfully.")
-        logging.info(f"Response data structure: {json.dumps(data, indent=2)}")
         return data
     except Exception as e:
         logging.error(f"Error fetching snapshot: {e}")
         return None
 
-def fetch_changes(last_sequence=None):
-    url = f"{BASE_URL}/markets/changes"
-    if last_sequence:
-        url += f"?sequence={last_sequence}"
+# ----------------------
+# NEW FUNCTION: get_live_market_data
+# ----------------------
+def get_live_market_data(event_id: str, team_name: str = None) -> dict:
+    """
+    Get live market data for a specific event from Unabated API.
     
-    headers = {"x-api-key": API_KEY}
-    logging.info(f"Fetching changes from {url}")
-    
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        logging.info(f"Changes data structure: {json.dumps(data, indent=2)}")
-        return data
-    except Exception as e:
-        logging.error(f"Error fetching changes: {e}")
-        return None
-
-def merge_changes_into_snapshot(snapshot_data, changes_data):
-    """Extract newly changed odds from the 'changes' JSON."""
-    merged_rows = []
-    for result in changes_data.get("results", []):
-        # if it has "gameOdds" -> "gameOddsEvents"
-        if "gameOdds" in result and "gameOddsEvents" in result["gameOdds"]:
-            partial = parse_game_odds_events(result["gameOdds"]["gameOddsEvents"])
-            merged_rows.extend(partial)
-    return merged_rows
-
-def fetch_and_store_odds():
-    """Fetch odds from Unabated API and store in database."""
+    Args:
+        event_id: The event ID to fetch data for
+        team_name: Optional team name to help with matching
+        
+    Returns:
+        A dictionary containing market data
+    """
     try:
         # Get API key from environment
-        api_key = os.getenv('UNABATED_API_KEY')
+        api_key = os.getenv("UNABATED_API_KEY")
         if not api_key:
-            raise ValueError("UNABATED_API_KEY environment variable not set")
-
-        # Fetch data from Unabated API
-        url = "https://partner-api.unabated.com/api/markets/gameOdds"
-        headers = {"x-api-key": api_key}
-        
-        response = requests.get(url, headers=headers)
+            logging.warning("UNABATED_API_KEY not found in environment variables")
+            return None
+            
+        # Get snapshot of all markets
+        url = f"https://partner-api.unabated.com/api/markets/gameOdds?x-api-key={api_key}"
+        response = requests.get(url)
         response.raise_for_status()
-        
         data = response.json()
         
-        # Parse and store events
-        events = parse_game_odds_events(data)
-        store_game_odds(events)
+        # Only look at NBA games (league ID 3)
+        nba_pregame_key = "lg3:pt1:pregame"
+        if nba_pregame_key not in data.get("gameOddsEvents", {}):
+            logging.warning(f"No NBA pregame data found in API response")
+            return None
+            
+        nba_events = data["gameOddsEvents"][nba_pregame_key]
+        logging.info(f"Found {len(nba_events)} NBA events")
         
-        # Return timestamp for changes endpoint
-        return data.get('lastTimestamp')
+        # Try to find the event by ID
+        event = None
+        for evt in nba_events:
+            if str(evt.get("eventId")) == event_id:
+                event = evt
+                break
+                
+        # If not found by ID, try alternative formats
+        if not event and event_id:
+            # Try hex format
+            for evt in nba_events:
+                if evt.get("eventId") == int(event_id, 16):
+                    event = evt
+                    break
         
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching odds: {e}")
+        # If still not found and we have a team name, try to match by team
+        if not event and team_name:
+            team_abbr = get_team_abbr(team_name)
+            
+            for evt in nba_events:
+                home_team_id = evt.get("homeTeam", {}).get("id")
+                away_team_id = evt.get("awayTeam", {}).get("id")
+                
+                home_abbr = NBA_TEAM_IDS.get(home_team_id)
+                away_abbr = NBA_TEAM_IDS.get(away_team_id)
+                
+                if team_abbr in [home_abbr, away_abbr]:
+                    event = evt
+                    logging.info(f"Found event by team abbreviation: {team_abbr}")
+                    break
+                    
+                # Try by full name
+                home_name = evt.get("homeTeam", {}).get("name", "").lower()
+                away_name = evt.get("awayTeam", {}).get("name", "").lower()
+                
+                if team_name.lower() in [home_name, away_name]:
+                    event = evt
+                    logging.info(f"Found event by team name: {team_name}")
+                    break
+                    
+        # If still not found, give up
+        if not event:
+            logging.warning(f"No matching event found for event_id {event_id} or team {team_name}")
+            return None
+            
+        # Extract relevant data
+        home_team = event.get("homeTeam", {}).get("name")
+        away_team = event.get("awayTeam", {}).get("name")
+        
+        # Get market lines
+        market_lines = event.get("marketLines", [])
+        
+        # Extract best lines
+        best_lines = {
+            "moneyline_home": None,
+            "moneyline_away": None,
+            "spread": None,
+            "total": None
+        }
+        
+        for line in market_lines:
+            bet_type = line.get("betType")
+            side = line.get("side")
+            
+            if bet_type == 1:  # Moneyline
+                if side == 0:  # Away
+                    best_lines["moneyline_away"] = line.get("price")
+                elif side == 1:  # Home
+                    best_lines["moneyline_home"] = line.get("price")
+            elif bet_type == 2:  # Spread
+                if side == 0:  # Away
+                    best_lines["spread"] = line.get("number")
+            elif bet_type == 3:  # Total
+                best_lines["total"] = line.get("number")
+                
+        logging.info(f"Found markets: {best_lines}")
+        
+        return {
+            "event_id": event.get("eventId"),
+            "game_clock": event.get("gameClock"),
+            "home_team": home_team,
+            "away_team": away_team,
+            **best_lines,
+            "current_price": None,  # For sell signal generator
+            "live_vol": None,       # For sell signal generator
+            "expected_vol": None    # For sell signal generator
+        }
+        
     except Exception as e:
-        print(f"Error processing odds: {e}")
-    
-    return None
+        logging.error(f"Error fetching live market data: {str(e)}")
+        return None
 
 def fetch_changes(last_timestamp):
-    """Fetch changes since last timestamp."""
+    """Fetch changes since last timestamp (if needed)."""
     try:
-        api_key = os.getenv('UNABATED_API_KEY')
-        if not api_key:
-            raise ValueError("UNABATED_API_KEY environment variable not set")
-            
-        url = f"https://partner-api.unabated.com/api/markets/changes"
+        url = f"{BASE_URL}/markets/changes"
         if last_timestamp:
             url += f"/{last_timestamp}"
-            
-        headers = {"x-api-key": api_key}
-        
+        headers = {"x-api-key": API_KEY}
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        
         data = response.json()
-        
-        # Check result code
         if data.get('resultCode') == 'Failed':
             print("Changes request failed - need to fetch full snapshot")
             return None
-            
-        # Parse and store events
         events = parse_game_odds_events(data)
         store_game_odds(events)
-        
         return data.get('lastTimestamp')
-        
     except Exception as e:
         print(f"Error fetching changes: {e}")
         return None
 
 def run():
     """Main run loop to continuously fetch odds."""
-    # Reset database on startup
     reset_database()
-    
-    # First get initial snapshot
-    last_timestamp = fetch_and_store_odds()
-    
+    last_timestamp = fetch_snapshot()
     while True:
-        try:
-            # Get changes since last timestamp
-            new_timestamp = fetch_changes(last_timestamp)
+        new_timestamp = fetch_changes(last_timestamp)
+        if new_timestamp is None:
+            last_timestamp = fetch_snapshot()
+        else:
+            last_timestamp = new_timestamp
+        time.sleep(1)
+
+def find_event_by_teams(data: dict, team_name: str) -> dict:
+    """Try to find event by matching team names."""
+    teams_data = data.get('teams', {})
+    game_odds_events = data.get('gameOddsEvents', {})
+    
+    # First find team ID
+    team_id = None
+    for id, team_info in teams_data.items():
+        if team_name.lower() in team_info.get('name', '').lower():
+            team_id = id
+            break
+    
+    if not team_id:
+        return None
+        
+    # Then find event with this team
+    for league_key, events in game_odds_events.items():
+        for event in events:
+            event_teams = event.get('eventTeams', {})
+            for side in ['0', '1']:
+                if str(event_teams.get(side, {}).get('id')) == team_id:
+                    return event
+                    
+    return None
+
+def get_live_market_data_by_team(team_name: str) -> dict:
+    """
+    Fetch live market data by searching for a team name.
+    """
+    logging.info(f"Fetching live market data for team: {team_name}")
+    data = fetch_snapshot()
+    if not data:
+        logging.error("Failed to fetch snapshot from API")
+        return None
+        
+    # Find event by team name
+    event = find_event_by_teams(data, team_name)
+    if not event:
+        logging.warning(f"No event found for team {team_name}")
+        return None
+        
+    # Get team data
+    teams_data = data.get('teams', {})
+    event_teams = event.get('eventTeams', {})
+    
+    # Get team names from the teams dictionary
+    home_team = teams_data.get(str(event_teams.get('1', {}).get('id')), {}).get('name')
+    away_team = teams_data.get(str(event_teams.get('0', {}).get('id')), {}).get('name')
+    
+    logging.info(f"Found event: {away_team} @ {home_team}")
+    
+    # Get market lines
+    market_lines = event.get('gameOddsMarketSourcesLines', {})
+    
+    # Initialize containers for all markets
+    best_lines = {
+        'spread': None,
+        'total': None,
+        'moneyline_home': None,
+        'moneyline_away': None
+    }
+    
+    for key_line, line_data in market_lines.items():
+        parts = key_line.split(':')
+        if len(parts) < 2:
+            continue
             
-            # If changes request failed, get new snapshot
-            if new_timestamp is None:
-                last_timestamp = fetch_and_store_odds()
-            else:
-                last_timestamp = new_timestamp
-                
-            # Wait 1 second before next request
-            time.sleep(1)
+        side = int(parts[0].replace('si', ''))  # 0=away/over, 1=home/under
+        sportsbook = int(parts[1].replace('ms', ''))
+        
+        for bet_type, details in line_data.items():
+            bet_type_id = int(bet_type.replace('bt', ''))
             
-        except Exception as e:
-            print(f"Error in run loop: {e}")
-            time.sleep(5)  # Wait longer on error
-            
+            if bet_type_id == 1:  # Moneyline
+                if side == 1:  # Home
+                    best_lines['moneyline_home'] = details.get('americanPrice')
+                else:  # Away
+                    best_lines['moneyline_away'] = details.get('americanPrice')
+            elif bet_type_id == 2:  # Spread
+                points = details.get('points')
+                if points is not None:
+                    # For home team, we want to show the actual spread (negative)
+                    points = points if side == 0 else -points
+                    best_lines['spread'] = points
+            elif bet_type_id == 3:  # Total
+                best_lines['total'] = details.get('points')
+    
+    logging.info(f"Found markets: {best_lines}")
+    
+    return {
+        "event_id": event.get('eventId'),
+        "game_clock": event.get('gameClock'),
+        "home_team": home_team,
+        "away_team": away_team,
+        **best_lines,
+        "current_price": None,  # For sell signal generator
+        "live_vol": None,       # For sell signal generator
+        "expected_vol": None    # For sell signal generator
+    }
+
 if __name__ == '__main__':
-    run() 
+    run()
